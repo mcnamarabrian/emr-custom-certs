@@ -5,37 +5,33 @@ A minimal PySpark "Hello World" project demonstrating Amazon EMR 7.9 with custom
 ## Architecture
 
 ```mermaid
-C4Context
-    title EMR Custom TLS Certificates - System Context
+flowchart TB
+    subgraph AWS["AWS Cloud"]
+        subgraph VPC["VPC (10.0.0.0/16)"]
+            subgraph Public["Public Subnet"]
+                NAT[NAT Gateway]
+            end
+            subgraph Private["Private Subnet"]
+                Primary["EMR Primary<br/>m5.xlarge"]
+                Core["EMR Core<br/>m5.xlarge"]
+                Lambda["Verify Certs Lambda<br/>Python 3.12"]
+            end
+        end
+        PCA["AWS Private CA"]
+        S3[("S3 Bucket")]
+    end
 
-    Person(operator, "Operator", "Deploys infrastructure and submits Spark jobs")
+    Operator((Operator))
 
-    Enterprise_Boundary(aws, "AWS Cloud") {
-        System_Boundary(vpc, "VPC (10.0.0.0/16)") {
-            Container_Boundary(public, "Public Subnet") {
-                Container(nat, "NAT Gateway", "AWS NAT", "Outbound internet for private subnet")
-            }
-
-            Container_Boundary(private, "Private Subnet") {
-                Container(primary, "EMR Primary", "m5.xlarge", "HDFS NameNode, YARN ResourceManager, Spark History Server")
-                Container(core, "EMR Core", "m5.xlarge", "HDFS DataNode, YARN NodeManager")
-                Container(lambda, "Verify Certs Lambda", "Python 3.12", "Verifies TLS certificates on EMR nodes")
-            }
-        }
-
-        System_Ext(pca, "AWS Private CA", "Issues TLS certificates for EMR nodes")
-        SystemDb(s3, "S3 Bucket", "Stores logs, scripts, and certificate bundle")
-    }
-
-    Rel(operator, lambda, "Invokes", "AWS CLI")
-    Rel(operator, s3, "Uploads scripts", "AWS CLI")
-    Rel(lambda, primary, "Verifies TLS certs", "SSL/TLS")
-    Rel(lambda, core, "Verifies TLS certs", "SSL/TLS")
-    Rel(primary, core, "TLS encrypted", "Custom CA certs")
-    Rel(primary, s3, "Reads scripts, writes logs", "HTTPS")
-    Rel(core, s3, "Writes logs", "HTTPS")
-    Rel(primary, pca, "Obtains certificates", "ACM PCA API")
-    Rel(private, nat, "Outbound traffic", "")
+    Operator -->|"AWS CLI"| Lambda
+    Operator -->|"Upload scripts"| S3
+    Lambda -->|"SSL/TLS"| Primary
+    Lambda -->|"SSL/TLS"| Core
+    Primary <-->|"TLS encrypted"| Core
+    Primary -->|"HTTPS"| S3
+    Core -->|"HTTPS"| S3
+    Primary -->|"ACM PCA API"| PCA
+    Private -->|"Outbound"| NAT
 ```
 
 ### Components
