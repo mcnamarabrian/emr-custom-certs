@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#MISE description="Deploy EMR cluster stack (run after generate-certs)"
+set -euo pipefail
+
+# Verify certificates exist in S3
+S3_BUCKET=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactsBucket'].OutputValue" \
+  --output text)
+
+if ! mise x -- aws s3 ls "s3://${S3_BUCKET}/certs/emr-certs.zip" > /dev/null 2>&1; then
+  echo "Error: Certificate bundle not found at s3://${S3_BUCKET}/certs/emr-certs.zip"
+  echo "Run 'mise run generate-certs' first"
+  exit 1
+fi
+
+echo "Certificate bundle found, deploying EMR cluster..."
+
+mise x -- aws cloudformation deploy \
+  --template-file emr-template.yaml \
+  --stack-name "${EMR_STACK_NAME}" \
+  --parameter-overrides BaseStackName="${STACK_NAME}" \
+  --capabilities CAPABILITY_IAM \
+  --no-fail-on-empty-changeset
+
+echo ""
+echo "EMR cluster deployment initiated."
+echo "Run 'mise run cluster-status' to check progress."

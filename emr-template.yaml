@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR cluster with custom TLS certificates.
+  Imports infrastructure from base stack.
+
+Parameters:
+  BaseStackName:
+    Type: String
+    Default: emr-custom-certs
+    Description: Name of the base infrastructure stack
+
+  EMRInstanceType:
+    Type: String
+    Default: m5.xlarge
+
+  EMRReleaseLabel:
+    Type: String
+    Default: emr-7.9.0
+
+Resources:
+  #############################################################################
+  # EMR Security Configuration
+  #############################################################################
+  EMRSecurityConfiguration:
+    Type: AWS::EMR::SecurityConfiguration
+    Properties:
+      Name: !Sub ${AWS::StackName}-security-config
+      SecurityConfiguration:
+        EncryptionConfiguration:
+          EnableInTransitEncryption: true
+          EnableAtRestEncryption: false
+          InTransitEncryptionConfiguration:
+            TLSCertificateConfiguration:
+              CertificateProviderType: PEM
+              S3Object: !Sub
+                - s3://${Bucket}/certs/emr-certs.zip
+                - Bucket: !ImportValue
+                    Fn::Sub: ${BaseStackName}-ArtifactsBucket
+
+  #############################################################################
+  # EMR Cluster
+  #############################################################################
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub ${AWS::StackName}-cluster
+      ReleaseLabel: !Ref EMRReleaseLabel
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+        - Name: Livy
+      ServiceRole: !ImportValue
+        Fn::Sub: ${BaseStackName}-EMRServiceRoleArn
+      JobFlowRole: !ImportValue
+        Fn::Sub: ${BaseStackName}-EMREC2InstanceProfileArn
+      LogUri: !Sub
+        - s3://${Bucket}/logs/
+        - Bucket: !ImportValue
+            Fn::Sub: ${BaseStackName}-ArtifactsBucket
+      SecurityConfiguration: !Ref EMRSecurityConfiguration
+      VisibleToAllUsers: true
+      Instances:
+        Ec2SubnetId: !ImportValue
+          Fn::Sub: ${BaseStackName}-PrivateSubnetId
+        EmrManagedMasterSecurityGroup: !ImportValue
+          Fn::Sub: ${BaseStackName}-EMRPrimarySecurityGroupId
+        EmrManagedSlaveSecurityGroup: !ImportValue
+          Fn::Sub: ${BaseStackName}-EMRCoreSecurityGroupId
+        ServiceAccessSecurityGroup: !ImportValue
+          Fn::Sub: ${BaseStackName}-EMRServiceAccessSecurityGroupId
+        TerminationProtected: false
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref EMRInstanceType
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref EMRInstanceType
+          Market: ON_DEMAND
+          Name: Core
+
+Outputs:
+  EMRClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EMRCluster
+
+  EMRSecurityConfigurationName:
+    Description: EMR Security Configuration name
+    Value: !Ref EMRSecurityConfiguration

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#MISE description="Verify TLS certificates on EMR cluster nodes"
+set -euo pipefail
+
+# Get cluster ID
+CLUSTER_ID=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${EMR_STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='EMRClusterId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [[ -z "${CLUSTER_ID}" || "${CLUSTER_ID}" == "None" ]]; then
+  echo "Error: Could not find EMR Cluster ID"
+  exit 1
+fi
+
+# Get primary node DNS (private DNS for Lambda access)
+PRIMARY_DNS=$(mise x -- aws emr list-instances \
+  --cluster-id "${CLUSTER_ID}" \
+  --instance-group-types MASTER \
+  --query 'Instances[0].PrivateDnsName' \
+  --output text)
+
+# Get core node DNS (first core node)
+CORE_DNS=$(mise x -- aws emr list-instances \
+  --cluster-id "${CLUSTER_ID}" \
+  --instance-group-types CORE \
+  --query 'Instances[0].PrivateDnsName' \
+  --output text 2>/dev/null || echo "")
+
+# Get Private CA ARN and extract CA common name
+CA_ARN=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='PrivateCAArn'].OutputValue" \
+  --output text)
+
+CA_CN=$(mise x -- aws acm-pca describe-certificate-authority \
+  --certificate-authority-arn "${CA_ARN}" \
+  --query 'CertificateAuthority.CertificateAuthorityConfiguration.Subject.CommonName' \
+  --output text)
+
+# Get Lambda function ARN
+LAMBDA_ARN=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='VerifyCertsFunctionArn'].OutputValue" \
+  --output text)
+
+echo "============================================"
+echo "EMR TLS Certificate Verification"
+echo "============================================"
+echo ""
+echo "Cluster ID:     ${CLUSTER_ID}"
+echo "Primary Node:   ${PRIMARY_DNS}"
+echo "Core Node:      ${CORE_DNS:-N/A}"
+echo "Expected CA:    ${CA_CN}"
+echo ""
+echo "Invoking verification Lambda..."
+echo ""
+
+# Invoke Lambda and capture response to temp file
+TEMP_FILE=$(mktemp)
+trap "rm -f ${TEMP_FILE}" EXIT
+
+INVOKE_RESULT=$(mise x -- aws lambda invoke \
+  --function-name "${LAMBDA_ARN}" \
+  --payload "{\"primary_dns\": \"${PRIMARY_DNS}\", \"core_dns\": \"${CORE_DNS}\", \"expected_ca\": \"${CA_CN}\"}" \
+  --cli-binary-format raw-in-base64-out \
+  "${TEMP_FILE}" 2>&1)
+
+# Check for Lambda errors
+if [[ ! -s "${TEMP_FILE}" ]]; then
+  echo "Error: Lambda invocation failed or returned empty response"
+  echo "Invoke result: ${INVOKE_RESULT}"
+  exit 1
+fi
+
+# Check if response contains an error
+if grep -q '"errorMessage"' "${TEMP_FILE}" 2>/dev/null; then
+  echo "Lambda execution error:"
+  cat "${TEMP_FILE}"
+  exit 1
+fi
+
+# Parse and display results
+python3 -c "
+import sys
+import json
+
+def format_dn(dn_dict):
+    \"\"\"Format a distinguished name dict into a readable string.\"\"\"
+    if not dn_dict:
+        return 'N/A'
+    parts = []
+    # Order: CN, O, OU, L, ST, C
+    for key in ['CN', 'O', 'OU', 'L', 'ST', 'C']:
+        if key in dn_dict:
+            parts.append(f'{key}={dn_dict[key]}')
+    return ', '.join(parts) if parts else 'N/A'
+
+def print_result(result):
+    status = result['status']
+    icons = {'PASS': '[PASS]', 'WARN': '[WARN]', 'INFO': '[INFO]'}
+    icon = icons.get(status, '[SKIP]')
+
+    print(f\"  {icon} {result['service']} (port {result['port']})\")
+    print(f\"        {result['message']}\")
+
+    # Show certificate details if available
+    if result.get('subject'):
+        print(f\"        Subject: {format_dn(result['subject'])}\")
+    if result.get('issuer'):
+        print(f\"        Issuer:  {format_dn(result['issuer'])}\")
+    if result.get('validity'):
+        validity = result['validity']
+        if validity.get('notBefore') or validity.get('notAfter'):
+            print(f\"        Valid:   {validity.get('notBefore', 'N/A')} to {validity.get('notAfter', 'N/A')}\")
+    print()
+
+try:
+    with open('${TEMP_FILE}', 'r') as f:
+        data = json.load(f)
+
+    print('Checking PRIMARY NODE:', data.get('primary_node', 'N/A'))
+    print('=' * 60)
+    print()
+
+    for result in data.get('primary_results', []):
+        print_result(result)
+
+    if data.get('core_results'):
+        print()
+        print('Checking CORE NODE:', data.get('core_node', 'N/A'))
+        print('=' * 60)
+        print()
+        for result in data.get('core_results', []):
+            print_result(result)
+
+    print()
+    print('Summary')
+    print('=' * 60)
+    summary = data.get('summary', {})
+    print(f\"  PASS: {summary.get('pass', 0)} (TLS with expected CA)\")
+    print(f\"  WARN: {summary.get('warn', 0)} (TLS with different CA)\")
+    print(f\"  INFO: {summary.get('info', 0)} (Port open, non-TLS protocol)\")
+    print(f\"  SKIP: {summary.get('skip', 0)} (Service not running)\")
+except json.JSONDecodeError as e:
+    print(f'Error parsing Lambda response: {e}')
+    with open('${TEMP_FILE}', 'r') as f:
+        print(f'Raw response: {f.read()[:500]}')
+    sys.exit(1)
+except Exception as e:
+    print(f'Error: {e}')
+    sys.exit(1)
+"

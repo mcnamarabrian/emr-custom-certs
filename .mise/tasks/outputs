@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Get stack outputs"
+set -euo pipefail
+
+mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query 'Stacks[0].Outputs' \
+  --output table

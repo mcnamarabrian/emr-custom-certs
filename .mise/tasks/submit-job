@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#MISE description="Submit PySpark hello world job to EMR cluster"
+set -euo pipefail
+
+# Get cluster ID from EMR stack outputs
+CLUSTER_ID=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${EMR_STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='EMRClusterId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [[ -z "${CLUSTER_ID}" || "${CLUSTER_ID}" == "None" ]]; then
+  echo "Error: Could not find EMR Cluster ID in stack outputs"
+  echo "Has the EMR cluster been deployed? Run 'mise run deploy-emr'"
+  exit 1
+fi
+
+# Get S3 bucket from base stack
+S3_BUCKET=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactsBucket'].OutputValue" \
+  --output text)
+
+echo "Uploading PySpark script to S3..."
+mise x -- aws s3 cp src/hello_world.py "s3://${S3_BUCKET}/scripts/hello_world.py"
+
+echo "Submitting job to EMR cluster: ${CLUSTER_ID}"
+
+STEP_ID=$(mise x -- aws emr add-steps \
+  --cluster-id "${CLUSTER_ID}" \
+  --steps "[{
+    \"Name\": \"PySpark Hello World\",
+    \"Type\": \"Spark\",
+    \"ActionOnFailure\": \"CONTINUE\",
+    \"Args\": [
+      \"--deploy-mode\", \"cluster\",
+      \"s3://${S3_BUCKET}/scripts/hello_world.py\"
+    ]
+  }]" \
+  --query 'StepIds[0]' \
+  --output text)
+
+echo "Step submitted: ${STEP_ID}"
+echo ""
+echo "To monitor the step:"
+echo "  aws emr describe-step --cluster-id ${CLUSTER_ID} --step-id ${STEP_ID}"

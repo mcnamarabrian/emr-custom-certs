@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#MISE description="Get output from the most recent EMR step"
+set -euo pipefail
+
+# Get cluster ID from EMR stack outputs
+CLUSTER_ID=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${EMR_STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='EMRClusterId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [[ -z "${CLUSTER_ID}" || "${CLUSTER_ID}" == "None" ]]; then
+  echo "Error: Could not find EMR Cluster ID in stack outputs"
+  exit 1
+fi
+
+# Get S3 bucket from base stack
+S3_BUCKET=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactsBucket'].OutputValue" \
+  --output text)
+
+# Get the most recent step ID
+STEP_ID=$(mise x -- aws emr list-steps \
+  --cluster-id "${CLUSTER_ID}" \
+  --query 'Steps[0].Id' \
+  --output text)
+
+if [[ -z "${STEP_ID}" || "${STEP_ID}" == "None" ]]; then
+  echo "Error: No steps found for cluster ${CLUSTER_ID}"
+  exit 1
+fi
+
+# Get step status
+STEP_INFO=$(mise x -- aws emr describe-step \
+  --cluster-id "${CLUSTER_ID}" \
+  --step-id "${STEP_ID}" \
+  --query 'Step.{Name: Name, State: Status.State, Message: Status.FailureDetails.Message}' \
+  --output text)
+
+echo "Cluster: ${CLUSTER_ID}"
+echo "Step: ${STEP_ID}"
+echo "Info: ${STEP_INFO}"
+echo ""
+echo "========== STDOUT =========="
+
+# Try to get stdout
+STDOUT_PATH="s3://${S3_BUCKET}/logs/${CLUSTER_ID}/steps/${STEP_ID}/stdout.gz"
+if mise x -- aws s3 ls "${STDOUT_PATH}" > /dev/null 2>&1; then
+  mise x -- aws s3 cp "${STDOUT_PATH}" - 2>/dev/null | gunzip 2>/dev/null || echo "(empty or not available)"
+else
+  echo "(not available yet - logs may take a few minutes to appear)"
+fi
+
+echo ""
+echo "========== STDERR =========="
+
+# Try to get stderr
+STDERR_PATH="s3://${S3_BUCKET}/logs/${CLUSTER_ID}/steps/${STEP_ID}/stderr.gz"
+if mise x -- aws s3 ls "${STDERR_PATH}" > /dev/null 2>&1; then
+  mise x -- aws s3 cp "${STDERR_PATH}" - 2>/dev/null | gunzip 2>/dev/null || echo "(empty or not available)"
+else
+  echo "(not available yet - logs may take a few minutes to appear)"
+fi
+
+echo ""
+echo "========== SPARK APPLICATION OUTPUT (YARN Container Logs) =========="
+
+# EMR can place logs in several locations - check them in order of likelihood
+LOG_BASE="s3://${S3_BUCKET}/logs/${CLUSTER_ID}"
+FOUND_LOGS=false
+
+# Pattern 1: containers/ directory (common for newer EMR versions)
+echo ""
+echo "Checking containers/ directory..."
+CONTAINER_LOGS=$(mise x -- aws s3 ls "${LOG_BASE}/containers/" --recursive 2>/dev/null | grep "stdout.gz" | sort | tail -5 | awk '{print $4}' || echo "")
+
+if [[ -n "${CONTAINER_LOGS}" ]]; then
+  FOUND_LOGS=true
+  for LOG in ${CONTAINER_LOGS}; do
+    echo ""
+    echo "--- ${LOG} ---"
+    mise x -- aws s3 cp "s3://${S3_BUCKET}/${LOG}" - 2>/dev/null | gunzip 2>/dev/null || echo "(could not decompress)"
+  done
+fi
+
+# Pattern 2: node/ directory with application logs
+if [[ "${FOUND_LOGS}" == "false" ]]; then
+  echo ""
+  echo "Checking node/ directory for application logs..."
+  NODE_LOGS=$(mise x -- aws s3 ls "${LOG_BASE}/node/" --recursive 2>/dev/null | grep -E "(stdout|application_)" | grep -v "stderr" | sort | tail -10 | awk '{print $4}' || echo "")
+
+  if [[ -n "${NODE_LOGS}" ]]; then
+    FOUND_LOGS=true
+    for LOG in ${NODE_LOGS}; do
+      echo ""
+      echo "--- ${LOG} ---"
+      if [[ "${LOG}" == *.gz ]]; then
+        mise x -- aws s3 cp "s3://${S3_BUCKET}/${LOG}" - 2>/dev/null | gunzip 2>/dev/null || echo "(could not decompress)"
+      else
+        mise x -- aws s3 cp "s3://${S3_BUCKET}/${LOG}" - 2>/dev/null || echo "(could not read)"
+      fi
+    done
+  fi
+fi
+
+# Pattern 3: applications/ directory
+if [[ "${FOUND_LOGS}" == "false" ]]; then
+  echo ""
+  echo "Checking applications/ directory..."
+  APP_LOGS=$(mise x -- aws s3 ls "${LOG_BASE}/applications/" --recursive 2>/dev/null | grep "stdout" | sort | tail -5 | awk '{print $4}' || echo "")
+
+  if [[ -n "${APP_LOGS}" ]]; then
+    FOUND_LOGS=true
+    for LOG in ${APP_LOGS}; do
+      echo ""
+      echo "--- ${LOG} ---"
+      if [[ "${LOG}" == *.gz ]]; then
+        mise x -- aws s3 cp "s3://${S3_BUCKET}/${LOG}" - 2>/dev/null | gunzip 2>/dev/null || echo "(could not decompress)"
+      else
+        mise x -- aws s3 cp "s3://${S3_BUCKET}/${LOG}" - 2>/dev/null || echo "(could not read)"
+      fi
+    done
+  fi
+fi
+
+# If no logs found, show available directories for troubleshooting
+if [[ "${FOUND_LOGS}" == "false" ]]; then
+  echo ""
+  echo "Container/application logs not found in expected locations."
+  echo "Note: YARN logs may take several minutes to appear after job completion."
+  echo ""
+  echo "Available log directories:"
+  mise x -- aws s3 ls "${LOG_BASE}/" 2>/dev/null || echo "(none found)"
+  echo ""
+  echo "To view logs manually, check the EMR console:"
+  echo "  https://console.aws.amazon.com/emr/home#/clusterDetails/${CLUSTER_ID}"
+fi

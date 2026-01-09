@@ -1,0 +1,10 @@
+[tools]
+python = "3.12"
+awscli = "latest"
+aws-sam-cli = "1.151.0"
+
+[env]
+AWS_REGION = "us-east-1"
+PROJECT_NAME = "emr-custom-certs"
+STACK_NAME = "emr-custom-certs"
+EMR_STACK_NAME = "emr-custom-certs-cluster"

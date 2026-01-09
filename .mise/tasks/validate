@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+#MISE description="Validate SAM templates"
+set -euo pipefail
+
+echo "Validating template.yaml..."
+mise x -- sam validate --lint --template template.yaml
+
+echo ""
+echo "Validating emr-template.yaml..."
+mise x -- sam validate --lint --template emr-template.yaml
+
+echo ""
+echo "All templates valid."

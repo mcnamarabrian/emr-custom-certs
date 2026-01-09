@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#MISE description="View EMR cluster logs from S3"
+set -euo pipefail
+
+# Get S3 bucket from base stack
+S3_BUCKET=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactsBucket'].OutputValue" \
+  --output text)
+
+# Get cluster ID from EMR stack
+CLUSTER_ID=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${EMR_STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='EMRClusterId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [[ -z "${S3_BUCKET}" || "${S3_BUCKET}" == "None" ]]; then
+  echo "Error: Could not find S3 bucket in stack outputs"
+  exit 1
+fi
+
+if [[ -z "${CLUSTER_ID}" || "${CLUSTER_ID}" == "None" ]]; then
+  echo "Warning: Could not find EMR Cluster ID"
+  LOG_PATH="s3://${S3_BUCKET}/logs/"
+else
+  LOG_PATH="s3://${S3_BUCKET}/logs/${CLUSTER_ID}/"
+fi
+
+echo "EMR Logs location: ${LOG_PATH}"
+echo ""
+echo "Listing available log directories..."
+
+mise x -- aws s3 ls "${LOG_PATH}" --recursive | head -50
+
+echo ""
+echo "To view specific logs, use:"
+echo "  aws s3 cp ${LOG_PATH}<path> -"

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#MISE description="Get EMR cluster status and details"
+set -euo pipefail
+
+# Get cluster ID from EMR stack outputs
+CLUSTER_ID=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${EMR_STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='EMRClusterId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [[ -z "${CLUSTER_ID}" || "${CLUSTER_ID}" == "None" ]]; then
+  echo "Error: Could not find EMR Cluster ID in stack outputs"
+  echo "Has the EMR cluster been deployed? Run 'mise run deploy-emr'"
+  exit 1
+fi
+
+echo "EMR Cluster: ${CLUSTER_ID}"
+echo "================================"
+
+mise x -- aws emr describe-cluster \
+  --cluster-id "${CLUSTER_ID}" \
+  --query 'Cluster.{
+    Name: Name,
+    Status: Status.State,
+    StateChangeReason: Status.StateChangeReason.Message,
+    MasterDns: MasterPublicDnsName,
+    NormalizedInstanceHours: NormalizedInstanceHours
+  }' \
+  --output table
+
+echo ""
+echo "Instance Groups:"
+mise x -- aws emr describe-cluster \
+  --cluster-id "${CLUSTER_ID}" \
+  --query 'Cluster.InstanceGroups[].{
+    Name: Name,
+    Type: InstanceGroupType,
+    InstanceType: InstanceType,
+    RequestedCount: RequestedInstanceCount,
+    RunningCount: RunningInstanceCount,
+    Status: Status.State
+  }' \
+  --output table

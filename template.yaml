@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Base infrastructure for EMR with custom TLS certificates.
+  Includes VPC, Private CA, S3 bucket, and IAM roles.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  EMRInstanceType:
+    Type: String
+    Default: m5.xlarge
+
+Resources:
+  #############################################################################
+  # VPC Infrastructure
+  #############################################################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: 'true'
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  #############################################################################
+  # VPC Endpoints
+  #############################################################################
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
+  #############################################################################
+  # Security Groups
+  #############################################################################
+  EMRPrimarySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EMR primary node
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-emr-primary-sg
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: 'true'
+
+  EMRCoreSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EMR core nodes
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-emr-core-sg
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: 'true'
+
+  EMRServiceAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EMR service access
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-emr-service-sg
+        - Key: for-use-with-amazon-emr-managed-policies
+          Value: 'true'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions in VPC
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-lambda-sg
+
+  # Allow Lambda to access EMR primary node ports for TLS verification
+  EMRPrimaryFromLambdaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRPrimarySecurityGroup
+      IpProtocol: tcp
+      FromPort: 8020
+      ToPort: 19888
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # Allow Lambda to access EMR core node ports for TLS verification
+  EMRCoreFromLambdaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRCoreSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8020
+      ToPort: 19888
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # EMR primary to core communication
+  EMRCoreFromPrimaryIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRCoreSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EMRPrimarySecurityGroup
+
+  EMRPrimaryFromCoreIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRPrimarySecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EMRCoreSecurityGroup
+
+  # Core to core communication
+  EMRCoreFromCoreIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRCoreSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EMRCoreSecurityGroup
+
+  # Primary self-reference
+  EMRPrimaryFromPrimaryIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRPrimarySecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EMRPrimarySecurityGroup
+
+  # Service access security group rules
+  EMRServiceAccessFromPrimaryIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRServiceAccessSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9443
+      ToPort: 9443
+      SourceSecurityGroupId: !Ref EMRPrimarySecurityGroup
+
+  EMRPrimaryFromServiceAccessIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EMRPrimarySecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref EMRServiceAccessSecurityGroup
+
+  #############################################################################
+  # S3 Bucket for EMR logs and artifacts
+  #############################################################################
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-artifacts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-artifacts
+
+  #############################################################################
+  # Lambda Log Groups (14-day retention)
+  #############################################################################
+  EmptyBucketFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-empty-bucket
+      RetentionInDays: 14
+
+  DeleteCAFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-delete-ca
+      RetentionInDays: 14
+
+  VerifyCertsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-verify-certs
+      RetentionInDays: 14
+
+  #############################################################################
+  # Lambda Functions
+  #############################################################################
+  # Lambda to empty bucket on stack deletion
+  EmptyBucketFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: EmptyBucketFunctionLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-empty-bucket
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      CodeUri: ./src/lambda/empty_bucket/
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource:
+                - !GetAtt ArtifactsBucket.Arn
+                - !Sub ${ArtifactsBucket.Arn}/*
+
+  EmptyBucketOnDelete:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketFunction.Arn
+      BucketName: !Ref ArtifactsBucket
+
+  #############################################################################
+  # AWS Private CA
+  #############################################################################
+  PrivateCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Type: ROOT
+      KeyAlgorithm: RSA_2048
+      SigningAlgorithm: SHA256WITHRSA
+      Subject:
+        CommonName: !Sub ${AWS::StackName}-emr-ca
+        Organization: mc-namara
+        OrganizationalUnit: Engineering
+        Country: US
+        State: New Jersey
+        Locality: Frenchtown
+      RevocationConfiguration:
+        CrlConfiguration:
+          Enabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-ca
+
+  # Lambda to delete Private CA on stack deletion
+  DeleteCAFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: DeleteCAFunctionLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-delete-ca
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      CodeUri: ./src/lambda/delete_ca/
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - acm-pca:DescribeCertificateAuthority
+                - acm-pca:UpdateCertificateAuthority
+                - acm-pca:DeleteCertificateAuthority
+              Resource: !GetAtt PrivateCA.Arn
+
+  DeleteCAOnDelete:
+    Type: Custom::DeleteCA
+    Properties:
+      ServiceToken: !GetAtt DeleteCAFunction.Arn
+      CertificateAuthorityArn: !GetAtt PrivateCA.Arn
+
+  #############################################################################
+  # TLS Certificate Verification Lambda
+  #############################################################################
+  VerifyCertsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: VerifyCertsFunctionLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-verify-certs
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      CodeUri: ./src/lambda/verify_certs/
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DeleteNetworkInterface
+              Resource: '*'
+
+  #############################################################################
+  # IAM Roles
+  #############################################################################
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-emr-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+      Policies:
+        - PolicyName: PrivateCAAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm-pca:IssueCertificate
+                  - acm-pca:GetCertificate
+                  - acm-pca:GetCertificateAuthorityCertificate
+                  - acm-pca:DescribeCertificateAuthority
+                Resource: !GetAtt PrivateCA.Arn
+
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-emr-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: S3ArtifactsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
+        - PolicyName: PrivateCAAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm-pca:GetCertificateAuthorityCertificate
+                Resource: !GetAtt PrivateCA.Arn
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-emr-ec2-profile
+      Roles:
+        - !Ref EMREC2Role
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetId
+
+  PrivateSubnetId:
+    Description: Private subnet ID
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnetId
+
+  PrivateCAArn:
+    Description: Private CA ARN
+    Value: !GetAtt PrivateCA.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateCAArn
+
+  ArtifactsBucket:
+    Description: S3 bucket for EMR artifacts and logs
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ArtifactsBucket
+
+  EMRServiceRoleArn:
+    Description: EMR Service Role ARN
+    Value: !GetAtt EMRServiceRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EMRServiceRoleArn
+
+  EMREC2InstanceProfileArn:
+    Description: EMR EC2 Instance Profile ARN
+    Value: !GetAtt EMREC2InstanceProfile.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EMREC2InstanceProfileArn
+
+  EMRPrimarySecurityGroupId:
+    Description: EMR Primary Security Group ID
+    Value: !Ref EMRPrimarySecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EMRPrimarySecurityGroupId
+
+  EMRCoreSecurityGroupId:
+    Description: EMR Core Security Group ID
+    Value: !Ref EMRCoreSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EMRCoreSecurityGroupId
+
+  EMRServiceAccessSecurityGroupId:
+    Description: EMR Service Access Security Group ID
+    Value: !Ref EMRServiceAccessSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EMRServiceAccessSecurityGroupId
+
+  VerifyCertsFunctionArn:
+    Description: ARN of the TLS certificate verification Lambda function
+    Value: !GetAtt VerifyCertsFunction.Arn

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#MISE description="Generate EMR certificate bundle using Private CA and upload to S3"
+#MISE depends=["create-ca-cert"]
+set -euo pipefail
+
+WORK_DIR=$(mktemp -d)
+trap "rm -rf ${WORK_DIR}" EXIT
+
+echo "Working directory: ${WORK_DIR}"
+
+# Get stack outputs
+CA_ARN=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='PrivateCAArn'].OutputValue" \
+  --output text)
+
+S3_BUCKET=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='ArtifactsBucket'].OutputValue" \
+  --output text)
+
+if [[ -z "${CA_ARN}" || "${CA_ARN}" == "None" ]]; then
+  echo "Error: Could not find Private CA ARN in stack outputs"
+  exit 1
+fi
+
+if [[ -z "${S3_BUCKET}" || "${S3_BUCKET}" == "None" ]]; then
+  echo "Error: Could not find S3 bucket in stack outputs"
+  exit 1
+fi
+
+echo "Private CA ARN: ${CA_ARN}"
+echo "S3 Bucket: ${S3_BUCKET}"
+
+# Check CA status
+CA_STATUS=$(mise x -- aws acm-pca describe-certificate-authority \
+  --certificate-authority-arn "${CA_ARN}" \
+  --query 'CertificateAuthority.Status' \
+  --output text)
+
+if [[ "${CA_STATUS}" != "ACTIVE" ]]; then
+  echo "Error: Private CA is not active (status: ${CA_STATUS})"
+  echo "Run 'mise run create-ca-cert' first"
+  exit 1
+fi
+
+echo "Generating private key..."
+openssl genrsa -out "${WORK_DIR}/privateKey.pem" 2048
+
+echo "Generating CSR..."
+openssl req -new \
+  -key "${WORK_DIR}/privateKey.pem" \
+  -out "${WORK_DIR}/emr.csr" \
+  -subj "/CN=*.ec2.internal/O=EMR Custom Certs/C=US"
+
+echo "Issuing certificate from Private CA..."
+CERT_ARN=$(mise x -- aws acm-pca issue-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --csr "fileb://${WORK_DIR}/emr.csr" \
+  --signing-algorithm SHA256WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/EndEntityCertificate/V1 \
+  --validity Value=365,Type=DAYS \
+  --query 'CertificateArn' \
+  --output text)
+
+echo "Certificate ARN: ${CERT_ARN}"
+
+echo "Waiting for certificate to be issued..."
+mise x -- aws acm-pca wait certificate-issued \
+  --certificate-authority-arn "${CA_ARN}" \
+  --certificate-arn "${CERT_ARN}"
+
+echo "Retrieving certificate..."
+mise x -- aws acm-pca get-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --certificate-arn "${CERT_ARN}" \
+  --query 'Certificate' \
+  --output text > "${WORK_DIR}/certificateChain.pem"
+
+echo "Retrieving CA certificate for trust store..."
+mise x -- aws acm-pca get-certificate-authority-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --query 'Certificate' \
+  --output text > "${WORK_DIR}/trustedCertificates.pem"
+
+echo "Creating certificate bundle..."
+cd "${WORK_DIR}"
+zip emr-certs.zip privateKey.pem certificateChain.pem trustedCertificates.pem
+
+echo "Uploading to S3..."
+mise x -- aws s3 cp emr-certs.zip "s3://${S3_BUCKET}/certs/emr-certs.zip"
+
+echo ""
+echo "Certificate bundle uploaded successfully!"
+echo "Location: s3://${S3_BUCKET}/certs/emr-certs.zip"
+echo ""
+echo "The EMR cluster will use these certificates for in-transit encryption."

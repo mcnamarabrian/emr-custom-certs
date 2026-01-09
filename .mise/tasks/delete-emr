@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#MISE description="Delete EMR cluster stack"
+set -euo pipefail
+
+echo "Deleting EMR cluster stack: ${EMR_STACK_NAME}"
+
+mise x -- aws cloudformation delete-stack --stack-name "${EMR_STACK_NAME}"
+
+echo "Waiting for stack deletion..."
+mise x -- aws cloudformation wait stack-delete-complete --stack-name "${EMR_STACK_NAME}"
+
+echo "EMR cluster stack deleted."

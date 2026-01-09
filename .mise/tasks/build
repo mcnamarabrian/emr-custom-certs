@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Build SAM application"
+set -euo pipefail
+
+mise x -- sam build

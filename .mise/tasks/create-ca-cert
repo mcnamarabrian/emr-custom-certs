@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#MISE description="Issue and install root CA certificate after Private CA is created"
+set -euo pipefail
+
+WORK_DIR=$(mktemp -d)
+trap "rm -rf ${WORK_DIR}" EXIT
+
+# Get the Private CA ARN from stack outputs
+CA_ARN=$(mise x -- aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='PrivateCAArn'].OutputValue" \
+  --output text)
+
+if [[ -z "${CA_ARN}" || "${CA_ARN}" == "None" ]]; then
+  echo "Error: Could not find Private CA ARN in stack outputs"
+  exit 1
+fi
+
+echo "Private CA ARN: ${CA_ARN}"
+
+# Check CA status
+CA_STATUS=$(mise x -- aws acm-pca describe-certificate-authority \
+  --certificate-authority-arn "${CA_ARN}" \
+  --query 'CertificateAuthority.Status' \
+  --output text)
+
+echo "CA Status: ${CA_STATUS}"
+
+if [[ "${CA_STATUS}" == "ACTIVE" ]]; then
+  echo "CA is already active with a certificate installed"
+  exit 0
+fi
+
+if [[ "${CA_STATUS}" != "PENDING_CERTIFICATE" ]]; then
+  echo "Error: CA is in unexpected status: ${CA_STATUS}"
+  exit 1
+fi
+
+echo "Generating CSR from Private CA..."
+mise x -- aws acm-pca get-certificate-authority-csr \
+  --certificate-authority-arn "${CA_ARN}" \
+  --output text > "${WORK_DIR}/ca.csr"
+
+echo "Issuing self-signed root CA certificate..."
+CERT_ARN=$(mise x -- aws acm-pca issue-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --csr "fileb://${WORK_DIR}/ca.csr" \
+  --signing-algorithm SHA256WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/RootCACertificate/V1 \
+  --validity Value=3650,Type=DAYS \
+  --query 'CertificateArn' \
+  --output text)
+
+echo "Certificate ARN: ${CERT_ARN}"
+
+echo "Waiting for certificate to be issued..."
+mise x -- aws acm-pca wait certificate-issued \
+  --certificate-authority-arn "${CA_ARN}" \
+  --certificate-arn "${CERT_ARN}"
+
+echo "Retrieving certificate..."
+mise x -- aws acm-pca get-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --certificate-arn "${CERT_ARN}" \
+  --query 'Certificate' \
+  --output text > "${WORK_DIR}/ca.pem"
+
+echo "Installing certificate on Private CA..."
+mise x -- aws acm-pca import-certificate-authority-certificate \
+  --certificate-authority-arn "${CA_ARN}" \
+  --certificate "fileb://${WORK_DIR}/ca.pem"
+
+echo "CA certificate installed successfully!"
+echo "CA is now ready to issue certificates for EMR."
