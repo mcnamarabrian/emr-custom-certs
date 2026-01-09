@@ -36,8 +36,6 @@ C4Context
     Rel(core, s3, "Writes logs", "HTTPS")
     Rel(primary, pca, "Obtains certificates", "ACM PCA API")
     Rel(private, nat, "Outbound traffic", "")
-
-    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
 ```
 
 ### Components
